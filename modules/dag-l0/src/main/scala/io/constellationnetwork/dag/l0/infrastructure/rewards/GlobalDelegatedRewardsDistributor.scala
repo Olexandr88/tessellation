@@ -18,7 +18,7 @@ import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
-import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal, UpdateDelegatedStake}
+import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.node.{DelegatedStakeRewardParameters, RewardFraction, UpdateNodeParameters}
 import io.constellationnetwork.schema.peer.PeerId
@@ -41,7 +41,7 @@ object GlobalDelegatedRewardsDistributor {
     delegatedRewardsConfig: DelegatedRewardsConfig
   ): F[DelegatedRewardsDistributor[F]] = {
 
-    Ref.of[F, SortedSet[DelegateRewardsOutput]](SortedSet.empty).map { latestRewardsRef =>
+    Ref.of[F, SortedSet[DelegateRewardsOutput]](SortedSet.from(List(DelegateRewardsOutput.empty))).map { latestRewardsRef =>
       new DelegatedRewardsDistributor[F] {
 
         // Define a high precision MathContext for consistent calculations
@@ -54,16 +54,6 @@ object GlobalDelegatedRewardsDistributor {
             .get(environment)
             .pure[F]
             .flatMap(Async[F].fromOption(_, new RuntimeException(s"Could not retrieve emission config for env: $environment")))
-            .map(f => f(epochProgress))
-
-        def getDistributionProgram(epochProgress: EpochProgress): F[ProgramsDistributionConfig] =
-          delegatedRewardsConfig.percentDistribution
-            .get(environment)
-            .pure[F]
-            .flatMap(
-              Async[F]
-                .fromOption(_, new RuntimeException(s"Could not retrieve program distribution config for env: $environment"))
-            )
             .map(f => f(epochProgress))
 
         /** Calculate the variable amount of rewards to mint for this epoch based on the config and epoch progress.
@@ -122,6 +112,33 @@ object GlobalDelegatedRewardsDistributor {
                 )
               } yield result
           }
+
+        def getKnownRewardsTicks: F[SortedSet[DelegateRewardsOutput]] = latestRewardsRef.get
+
+        private def getDistributionProgram(epochProgress: EpochProgress): F[ProgramsDistributionConfig] =
+          delegatedRewardsConfig.percentDistribution
+            .get(environment)
+            .pure[F]
+            .flatMap(
+              Async[F]
+                .fromOption(_, new RuntimeException(s"Could not retrieve program distribution config for env: $environment"))
+            )
+            .map(f => f(epochProgress))
+
+        private def getDagPrice(epochProgress: EpochProgress): F[NonNegFraction] =
+          for {
+            emConfig <- getEmissionConfig(epochProgress)
+            priceOption <- (epochProgress == EpochProgress.MinValue)
+              .pure[F]
+              .ifM(
+                emConfig.dagPrices.headOption.map(_._2).pure[F], // For MinValue, return the first price
+                emConfig.dagPrices.filter { case (epoch, _) => epoch.value <= epochProgress.value }
+                  .maxByOption(_._1.value.value)
+                  .map(_._2)
+                  .pure[F] // For any other epoch progress, find the applicable price
+              )
+            dagPrice <- Async[F].fromOption(priceOption, new RuntimeException("Empty DAG price configuration"))
+          } yield dagPrice
 
         private def calculateEmissionDistribution(
           activeDelegatedStakes: SortedMap[Address, SortedSet[DelegatedStakeRecord]],
@@ -189,59 +206,41 @@ object GlobalDelegatedRewardsDistributor {
           val epochsPerYear = BigDecimal(emConfig.epochsPerYear.value, mc)
           val transitionEpoch = BigDecimal(emConfig.asOfEpoch.value.value, mc)
           val totalSupply = BigDecimal(emConfig.totalSupply.value, mc)
+          val yearDiff = DecimalUtils.safeDivide(BigDecimal(epochProgress.value.value - transitionEpoch.toLong, mc), epochsPerYear)
 
-          if (emConfig.dagPrices.values.isEmpty) {
-            Slf4jLogger.getLogger[F].error("Empty DAG price configuration").as(Amount.empty)
-          } else {
-            val dagPrices = emConfig.dagPrices
-            val initialPrice = dagPrices.head._2.toBigDecimal
-            val currentPrice = getCurrentDagPrice(epochProgress, dagPrices).toBigDecimal
-            val yearDiff = DecimalUtils.safeDivide(BigDecimal(epochProgress.value.value - transitionEpoch.toLong, mc), epochsPerYear)
+          for {
+            // Price ratio
+            initialPrice <- getDagPrice(EpochProgress.MinValue).map(_.toBigDecimal)
+            currentPrice <- getDagPrice(epochProgress).map(_.toBigDecimal)
+            priceRatio = if (currentPrice <= 0) BigDecimal(0, mc) else initialPrice / currentPrice
 
-            for {
-              // Current year
-              currentYearFraction <- yearDiff.pure[F]
+            // Price impact
+            priceImpactValue = BigDecimal(Math.pow(priceRatio.toDouble, iImpact.toDouble), mc)
 
-              // Price ratio
-              priceRatio = if (currentPrice <= 0) BigDecimal(0, mc) else initialPrice / currentPrice
+            // Lambda * year difference
+            lambdaTimesTDiff = lambda * yearDiff
 
-              // Price impact
-              priceImpactValue = BigDecimal(Math.pow(priceRatio.toDouble, iImpact.toDouble), mc)
+            // exp(-lambdaTimesTDiff * priceImpactValue)
+            expArgValue = -lambdaTimesTDiff * priceImpactValue
+            expTimesPriceImpact = BigDecimal(Math.exp(expArgValue.toDouble), mc)
 
-              // Lambda * year difference
-              lambdaTimesTDiff = lambda * currentYearFraction
+            // Calculate inflation rate components
+            iInitialMinusTarget <- (iInitial - iTarget).pure[F]
+            diffTerm = iInitialMinusTarget * expTimesPriceImpact
+            uncappedInflationRate = iTarget + diffTerm
 
-              // exp(-lambdaTimesTDiff * priceImpactValue)
-              expArgValue = -lambdaTimesTDiff * priceImpactValue
-              expTimesPriceImpact = BigDecimal(Math.exp(expArgValue.toDouble), mc)
+            // Cap annual inflation at 6%
+            maxInflation = BigDecimal("0.06", mc)
+            annualInflationRate = if (uncappedInflationRate > maxInflation) maxInflation else uncappedInflationRate
 
-              // Calculate inflation rate components
-              iInitialMinusTarget <- (iInitial - iTarget).pure[F]
-              diffTerm = iInitialMinusTarget * expTimesPriceImpact
-              uncappedInflationRate = iTarget + diffTerm
+            // Annual emission calculation
+            annualEmissionValue = totalSupply * annualInflationRate
 
-              // Cap annual inflation at 6%
-              maxInflation = BigDecimal("0.06", mc)
-              annualInflationRate = if (uncappedInflationRate > maxInflation) maxInflation else uncappedInflationRate
-
-              // Annual emission calculation
-              annualEmissionValue = totalSupply * annualInflationRate
-
-              // Per epoch emission
-              perEpochEmissionValue = DecimalUtils.safeDivide(annualEmissionValue, epochsPerYear)
-              amount <- perEpochEmissionValue.roundedHalfUp(0).toAmount[F]
-            } yield amount
-          }
+            // Per epoch emission
+            perEpochEmissionValue = DecimalUtils.safeDivide(annualEmissionValue, epochsPerYear)
+            amount <- perEpochEmissionValue.roundedHalfUp(0).toAmount[F]
+          } yield amount
         }
-
-        private def getCurrentDagPrice(
-          epochProgress: EpochProgress,
-          dagPrices: Map[EpochProgress, NonNegFraction]
-        ): NonNegFraction =
-          dagPrices.filter { case (epoch, _) => epoch.value <= epochProgress.value }
-            .maxByOption(_._1.value.value)
-            .map(_._2)
-            .getOrElse(dagPrices.head._2)
 
         private def getStakedAmount(stakeRecord: DelegatedStakeRecord): Long =
           stakeRecord.event.value.amount.value.value + stakeRecord.rewards.value
@@ -278,34 +277,7 @@ object GlobalDelegatedRewardsDistributor {
             .map(Amount(_))
         }
 
-        private def calculateTotalRewardPerEpoch(
-          delegatorRewardsMap: Map[PeerId, Map[Address, Amount]],
-          nodeParametersMap: SortedMap[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)]
-        ): F[Amount] = {
-          val calcFullReward: (Long, (PeerId, Map[Address, Amount])) => Long = {
-            case (acc, (peerId, rewards)) =>
-              val nodeCommissionValue = nodeParametersMap.get(peerId.toId).map(_._1.delegatedStakeRewardParameters.reward).getOrElse(0.0)
-              val nodeCommission = BigDecimal(nodeCommissionValue)
-              val delegatePortion = if (nodeCommission >= 1.0) BigDecimal(0.0) else BigDecimal(1.0) - nodeCommission
-              val rewardsSum = rewards.values.map(_.value.value).sum
-              val rewardsBigDecimal = BigDecimal(rewardsSum)
-              if (delegatePortion == BigDecimal(0.0)) acc
-              else
-                acc + (rewardsBigDecimal / delegatePortion)
-                  .setScale(0, RoundingMode.HALF_UP)
-                  .longValue
-          }
-
-          val totalRewards = delegatorRewardsMap.foldLeft(0L)(calcFullReward)
-          NonNegLong
-            .from(totalRewards)
-            .pure[F]
-            .map(_.leftMap(new IllegalArgumentException(_)))
-            .flatMap(Async[F].fromEither(_))
-            .map(Amount(_))
-        }
-
-        private def calculateTotalDagAmount(
+        private def calculateDagSupply(
           lastSnapshotContext: GlobalSnapshotInfo
         ): F[Amount] = {
           val totalSpendableSupply = lastSnapshotContext.balances.values.map(_.value.value).sum
@@ -323,6 +295,7 @@ object GlobalDelegatedRewardsDistributor {
             .sum
 
           val totalSupply = totalSpendableSupply + totalPendingSupply + totalActiveRewards
+
           NonNegLong
             .from(totalSupply)
             .pure[F]
@@ -330,9 +303,6 @@ object GlobalDelegatedRewardsDistributor {
             .flatMap(Async[F].fromEither(_))
             .map(Amount(_))
         }
-
-        private def getCurrentDagPriceAmount(epochProgress: EpochProgress): F[Amount] =
-          latestRewardsRef.get.map(_.head.currentDagPrice)
 
         private def calculateDelegatorRewards(
           activeDelegatedStakes: SortedMap[Address, SortedSet[DelegatedStakeRecord]],
@@ -579,19 +549,14 @@ object GlobalDelegatedRewardsDistributor {
             totalDelegatedAmount <- calculateTotalDelegatedAmount(
               lastSnapshotContext.activeDelegatedStakes.getOrElse(SortedMap.empty)
             )
-            totalRewardPerEpoch <- calculateTotalRewardPerEpoch(
-              delegatorRewardsMap,
-              lastSnapshotContext.updateNodeParameters.getOrElse(SortedMap.empty)
-            )
-            totalDagAmount <- calculateTotalDagAmount(lastSnapshotContext)
-            currentDagPrice <- getCurrentDagPriceAmount(epochProgress)
+            totalDagAmount <- calculateDagSupply(lastSnapshotContext)
+            currentDagPrice <- getDagPrice(epochProgress).flatMap(_.toBigDecimal.toAmount)
 
             rewardsOutput = DelegateRewardsOutput(
               epochProgress,
               ordinal,
               totalDelegatedAmount,
-              totalRewardPerEpoch,
-              totalDagAmount,
+              totalEmittedReward,
               currentDagPrice
             )
 
@@ -603,6 +568,8 @@ object GlobalDelegatedRewardsDistributor {
               else updated
             }
 
+            _ <- latestRewardsRef.get.flatMap(r => Async[F].delay(println(s">>>>>> updated rewards ref: $r")))
+
           } yield
             DelegatedRewardsResult(
               delegatorRewardsMap,
@@ -613,8 +580,6 @@ object GlobalDelegatedRewardsDistributor {
               withdrawalRewardTxs,
               totalEmittedReward
             )
-
-        def getKnownRewardsTicks: F[SortedSet[DelegateRewardsOutput]] = latestRewardsRef.get
       }
     }
   }

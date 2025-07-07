@@ -168,7 +168,7 @@ final case class DelegatedStakesRoutes[F[_]: Async: Hasher](
       result <- for {
         emissionConfig <- delegatedRewardsDistributor.getEmissionConfig(latestRewardOutput.ep)
         nextPrice <- getNextDagPrice(emissionConfig, latestRewardOutput.ep)
-        avgRewardAmount <- calculateAverageReward(latestRewardOutput.totalRewardPerEpoch, latestRewardOutput.totalDelegatedAmount)
+        avgRewardAmount <- calculateAverageReward(latestRewardOutput.totalEmittedAmount, latestRewardOutput.totalDelegatedAmount)
         totalRewardsPerYear <- calculateAverageRewardOverAYear(avgRewardAmount, emissionConfig.epochsPerYear)
       } yield
         RewardsInfo(
@@ -177,8 +177,8 @@ final case class DelegatedStakesRoutes[F[_]: Async: Hasher](
           nextDagPrice = nextPrice,
           totalDelegatedAmount = latestRewardOutput.totalDelegatedAmount,
           latestAverageRewardPerDag = avgRewardAmount,
-          totalDagAmount = latestRewardOutput.totalDagAmount,
-          totalRewardPerEpoch = latestRewardOutput.totalRewardPerEpoch,
+          totalDagAmount = Amount.empty, // todo: how to calculate? Only have last info in distributor
+          totalRewardPerEpoch = latestRewardOutput.totalEmittedAmount,
           totalRewardsPerYearEstimate = totalRewardsPerYear
         )
     } yield result

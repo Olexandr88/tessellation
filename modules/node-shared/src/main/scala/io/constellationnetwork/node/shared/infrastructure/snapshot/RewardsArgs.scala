@@ -28,12 +28,19 @@ case class DelegateRewardsOutput(
   ep: EpochProgress,
   ord: SnapshotOrdinal,
   totalDelegatedAmount: Amount,
-  totalRewardPerEpoch: Amount,
-  totalDagAmount: Amount,
+  totalEmittedAmount: Amount,
   currentDagPrice: Amount
 ) extends RewardsOutput
 
 object DelegateRewardsOutput {
+  val empty: DelegateRewardsOutput = DelegateRewardsOutput(
+    EpochProgress.MinValue,
+    SnapshotOrdinal.MinValue,
+    Amount.empty,
+    Amount.empty,
+    Amount.empty
+  )
+
   implicit val delegateRewardsOutputOrdering: Ordering[DelegateRewardsOutput] =
     new Ordering[DelegateRewardsOutput] {
       def compare(x: DelegateRewardsOutput, y: DelegateRewardsOutput): Int = {

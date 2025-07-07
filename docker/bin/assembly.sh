@@ -1,4 +1,7 @@
 
+# Set SBT options for increased stack size
+export SBT_OPTS="-Xss4m"
+
 assemble_all() {
   sbt dagL0/assembly dagL1/assembly keytool/assembly wallet/assembly
 }
