@@ -59,8 +59,7 @@ object ConsensusQueue {
     override def requestFacilitation(trigger: Option[ConsensusTrigger]): F[Unit] = {
       val operation = ConsensusOperation.FacilitateRound[Key](trigger)
 
-      operationQueue.offer(operation) >>
-        logger.debug(s"Facilitation queued: trigger=${trigger.show}")
+      operationQueue.offer(operation)
     }
 
     override def requestStateUpdate(key: Key): F[Unit] =
@@ -84,10 +83,9 @@ object ConsensusQueue {
     def runProcessor: F[Unit] =
       operationQueue.take.flatMap {
         case ConsensusOperation.FacilitateRound(trigger) =>
-          logger.debug(s"Processing facilitation: trigger=${trigger.show}") >>
-            processFacilitation(trigger).handleErrorWith { err =>
-              logger.error(err)(s"Error processing facilitation: trigger=${trigger.show}")
-            }
+          processFacilitation(trigger).handleErrorWith { err =>
+            logger.error(err)(s"Error processing facilitation: trigger=${trigger.show}")
+          }
 
         case ConsensusOperation.UpdateState(key) =>
           processStateUpdate(key).handleErrorWith { err =>

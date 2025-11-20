@@ -8,9 +8,8 @@ import cats.syntax.all._
 import scala.concurrent.duration._
 
 import io.constellationnetwork.node.shared.config.types.ConsensusConfig
-import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
-import io.constellationnetwork.schema.peer.{PeerId, Unresponsive}
 
+import fs2.concurrent.SignallingRef
 import org.typelevel.log4cats.Logger
 
 private[consensus] object StallDetection {
@@ -25,9 +24,8 @@ private[consensus] object StallDetection {
     Kind
   ](
     key: Key,
-    state: ConsensusState[Key, Status, OutcomeC, Kind],
     config: ConsensusConfig,
-    stallDetectionRef: Ref[F, Map[Key, Long]],
+    stallDetectionRef: SignallingRef[F, Map[Key, Long]],
     consensusOps: ConsensusOps[Status, Kind],
     consensusStorage: ConsensusStorage[F, _, Key, Artifact, Context, Status, OutcomeC, Kind],
     consensusStateUpdater: ConsensusStateUpdater[F, Key, Artifact, Context, Status, OutcomeC, Kind],
@@ -51,7 +49,6 @@ private[consensus] object StallDetection {
                 logger.warn(s"Stall detected for consensus round {key=${key.toString}}") >>
                   processStallDetection(
                     key,
-                    state,
                     config,
                     consensusOps,
                     consensusStorage,
@@ -80,7 +77,6 @@ private[consensus] object StallDetection {
     Kind
   ](
     key: Key,
-    state: ConsensusState[Key, Status, OutcomeC, Kind],
     config: ConsensusConfig,
     consensusOps: ConsensusOps[Status, Kind],
     consensusStorage: ConsensusStorage[F, _, Key, Artifact, Context, Status, OutcomeC, Kind],
