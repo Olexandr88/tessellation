@@ -1,22 +1,20 @@
 package io.constellationnetwork.currency.l0.snapshot
 
 import cats.effect.Async
+import cats.effect.std.Queue
 import cats.syntax.semigroupk._
-
 import io.constellationnetwork.currency.l0.snapshot.schema.{CurrencyConsensusKind, CurrencyConsensusOutcome}
 import io.constellationnetwork.currency.schema.currency.CurrencySnapshotContext
 import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusRumorHandlers
 import io.constellationnetwork.node.shared.infrastructure.gossip.RumorHandler
 import io.constellationnetwork.node.shared.snapshot.currency._
 import io.constellationnetwork.security.HasherSelector
-
 import io.circe.Decoder
+import io.constellationnetwork.node.shared.infrastructure.consensus.engine.ConsensusCommand
 
 object CurrencyConsensusHandler {
   def make[F[_]: Async: HasherSelector](
-    storage: CurrencyConsensusStorage[F],
-    manager: CurrencyConsensusManager[F],
-    fns: CurrencySnapshotConsensusFunctions[F]
+    queue: Queue[F, ConsensusCommand]
   )(implicit eventDecoder: Decoder[CurrencySnapshotEvent]): RumorHandler[F] = {
     val all = new ConsensusRumorHandlers[
       F,
@@ -27,15 +25,15 @@ object CurrencyConsensusHandler {
       CurrencySnapshotStatus,
       CurrencyConsensusOutcome,
       CurrencyConsensusKind
-    ](storage, manager, fns)
+    ](queue)
 
     all.eventHandler <+>
       all.facilityHandler <+>
       all.proposalHandler <+>
       all.signatureHandler <+>
       all.binarySignatureHandler <+>
-      all.peerDeclarationAckHandler <+>
+      all.ackHandler <+>
       all.artifactHandler <+>
-      all.withdrawPeerDeclarationHandler
+      all.withdrawHandler
   }
 }

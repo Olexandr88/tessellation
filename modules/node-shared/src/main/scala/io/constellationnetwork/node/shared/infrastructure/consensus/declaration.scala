@@ -11,6 +11,7 @@ import derevo.derive
 
 object declaration {
 
+  @derive(eqv, show, encoder, decoder)
   sealed trait PeerDeclaration {
     def facilitatorsHash: Hash
   }
