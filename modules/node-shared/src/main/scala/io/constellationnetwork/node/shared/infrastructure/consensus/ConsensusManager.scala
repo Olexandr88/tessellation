@@ -86,6 +86,7 @@ object ConsensusManager {
       stallDetectionRef <- SignallingRef.of[F, Map[Key, Long]](Map.empty)
       managerRef <- Deferred[F, ConsensusManager[F, Key, Artifact, Context, Status, OutcomeC, Kind]]
       lateJoinerGraceRef <- Ref.of[F, Boolean](false)
+      lastFacilitationRef <- Ref.of[F, Map[Option[ConsensusTrigger], FiniteDuration]](Map.empty)
 
       queue <- ConsensusQueue.make[F, Key](
         processFacilitation = trigger => managerRef.get.flatMap(_.processFacilitation(trigger)),
@@ -165,8 +166,25 @@ object ConsensusManager {
             } yield ()
           }.void
 
+        private def debounceFacilitationRequest(trigger: Option[ConsensusTrigger]): F[Unit] = {
+          val debounceWindow = 100.milliseconds
+          for {
+            currentTime <- Clock[F].monotonic
+            lastTimes <- lastFacilitationRef.get
+            lastTime = lastTimes.get(trigger)
+            shouldFacilitate = lastTime.fold(true)(last => currentTime >= last + debounceWindow)
+            _ <-
+              if (shouldFacilitate) {
+                lastFacilitationRef.update(_ + (trigger -> currentTime)) >>
+                  queue.requestFacilitation(trigger)
+              } else {
+                logger.debug(s"Debouncing facilitation request {trigger=${trigger.show}, timeSinceLast=${lastTime.map(last => (currentTime - last).toMillis)}ms}")
+              }
+          } yield ()
+        }
+
         def facilitateOnEvent: F[Unit] =
-          queue.requestFacilitation(EventTrigger.some)
+          debounceFacilitationRequest(EventTrigger.some)
 
         def startFacilitatingAfterRollback(lastKey: Key, initialOutcome: OutcomeC): F[Unit] =
           consensusStorage
@@ -355,6 +373,7 @@ object ConsensusManager {
               consensusOps,
               consensusStorage,
               consensusStateUpdater,
+              clusterStorage,
               queue,
               logger,
               isFirstRoundAfterJoin

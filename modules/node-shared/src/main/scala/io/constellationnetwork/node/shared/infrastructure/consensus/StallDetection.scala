@@ -8,6 +8,7 @@ import cats.syntax.all._
 import scala.concurrent.duration._
 
 import io.constellationnetwork.node.shared.config.types.ConsensusConfig
+import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
 
 import fs2.concurrent.SignallingRef
 import org.typelevel.log4cats.Logger
@@ -29,6 +30,7 @@ private[consensus] object StallDetection {
     consensusOps: ConsensusOps[Status, Kind],
     consensusStorage: ConsensusStorage[F, _, Key, Artifact, Context, Status, OutcomeC, Kind],
     consensusStateUpdater: ConsensusStateUpdater[F, Key, Artifact, Context, Status, OutcomeC, Kind],
+    clusterStorage: ClusterStorage[F],
     queue: ConsensusQueue[F, Key],
     logger: Logger[F],
     isFirstRoundAfterJoin: Boolean
@@ -53,6 +55,7 @@ private[consensus] object StallDetection {
                     consensusOps,
                     consensusStorage,
                     consensusStateUpdater,
+                    clusterStorage,
                     queue,
                     logger
                   ) >>
@@ -81,6 +84,7 @@ private[consensus] object StallDetection {
     consensusOps: ConsensusOps[Status, Kind],
     consensusStorage: ConsensusStorage[F, _, Key, Artifact, Context, Status, OutcomeC, Kind],
     consensusStateUpdater: ConsensusStateUpdater[F, Key, Artifact, Context, Status, OutcomeC, Kind],
+    clusterStorage: ClusterStorage[F],
     queue: ConsensusQueue[F, Key],
     logger: Logger[F]
   ): F[Unit] =
@@ -97,7 +101,21 @@ private[consensus] object StallDetection {
                   .traverse { ackKind =>
                     for {
                       resources <- consensusStorage.getResources(key)
-                      _ <- consensusStateUpdater.trySpreadAck(key, ackKind, resources)
+                      responsivePeerIds <- clusterStorage.getResponsivePeers.map(_.map(_.id))
+                      filteredResources = resources.copy(
+                        peerDeclarationsMap = resources.peerDeclarationsMap.filter { case (peerId, _) =>
+                          responsivePeerIds.contains(peerId)
+                        },
+                        acksMap = resources.acksMap.filter { case ((peerId, _), _) =>
+                          responsivePeerIds.contains(peerId)
+                        }
+                      )
+                      removedCount = resources.peerDeclarationsMap.size - filteredResources.peerDeclarationsMap.size
+                      _ <- logger.info(
+                        s"Filtered out $removedCount unresponsive peers for stall recovery {key=${key.toString}, " +
+                        s"total=${resources.peerDeclarationsMap.size}, responsive=${filteredResources.peerDeclarationsMap.size}}"
+                      )
+                      _ <- consensusStateUpdater.trySpreadAck(key, ackKind, filteredResources)
                       _ <- logger.debug(s"ACKs spread for stall recovery {key=${key.toString}, kind=${ackKind.toString}}")
                       _ <- logger.info(s"Requesting state update after spreading ACKs {key=${key.toString}}")
                       _ <- queue.requestStateUpdate(key)
