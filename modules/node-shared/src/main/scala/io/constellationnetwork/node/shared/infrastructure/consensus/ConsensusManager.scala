@@ -270,18 +270,14 @@ object ConsensusManager {
               }
           }
 
-        private def handleStatusUnchanged(key: Key, status: Status): F[Unit] = {
-          val isActive = isActiveCollectingPhase(status)
-          for {
-            _ <-
-              if (isActive) {
-                Temporal[F].sleep(config.activePhaseRetryInterval) >>
-                  queue.requestStateUpdate(key)
-              } else {
-                Async[F].unit
-              }
-          } yield ()
-        }
+        private def handleStatusUnchanged(key: Key, status: Status): F[Unit] = 
+          isActiveCollectingPhase(status).pure[F].ifM(
+            ifFalse = ().pure[F],
+            ifTrue = S.supervise(
+              Temporal[F].sleep(config.activePhaseRetryInterval) >>
+                queue.requestStateUpdate(key)
+            ).void
+          )
 
         private def handleNoUpdate(key: Key, status: Status): F[Unit] =
           handleStatusUnchanged(key, status)

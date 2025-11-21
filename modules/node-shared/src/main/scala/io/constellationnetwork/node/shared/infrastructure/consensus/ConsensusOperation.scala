@@ -7,6 +7,7 @@ import cats.{Order, Show}
 
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.ConsensusTrigger
 
+import fs2.Stream
 import org.typelevel.log4cats.Logger
 
 sealed trait ConsensusOperation[Key]
@@ -33,7 +34,7 @@ object ConsensusQueue {
     logger: Logger[F]
   )(implicit S: Supervisor[F]): F[ConsensusQueue[F, Key]] =
     for {
-      operationQueue <- Queue.unbounded[F, ConsensusOperation[Key]]
+      operationQueue <- Queue.bounded[F, ConsensusOperation[Key]](500)
       pendingUpdates <- Ref.of[F, Set[Key]](Set.empty)
 
       queue = new ConsensusQueueImpl[F, Key](
@@ -81,17 +82,21 @@ object ConsensusQueue {
       pendingUpdates.update(_ - key)
 
     def runProcessor: F[Unit] =
-      operationQueue.take.flatMap {
-        case ConsensusOperation.FacilitateRound(trigger) =>
-          processFacilitation(trigger).handleErrorWith { err =>
-            logger.error(err)(s"Error processing facilitation: trigger=${trigger.show}")
-          }
+      Stream
+        .fromQueueUnterminated(operationQueue)
+        .parEvalMap(8) {
+          case ConsensusOperation.FacilitateRound(trigger) =>
+            processFacilitation(trigger).handleErrorWith { err =>
+              logger.error(err)(s"Error processing facilitation: trigger=${trigger.show}")
+            }
 
-        case ConsensusOperation.UpdateState(key) =>
-          processStateUpdate(key).handleErrorWith { err =>
-            logger.error(err)(s"Error processing state update: key=${key.show}") >>
-              pendingUpdates.update(_ - key)
-          }
-      } >> runProcessor
+          case ConsensusOperation.UpdateState(key) =>
+            processStateUpdate(key).handleErrorWith { err =>
+              logger.error(err)(s"Error processing state update: key=${key.show}") >>
+                pendingUpdates.update(_ - key)
+            }
+        }
+        .compile
+        .drain
   }
 }
